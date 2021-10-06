@@ -1,27 +1,85 @@
-# This file contains the fastlane.tools configuration
-# You can find the documentation at https://docs.fastlane.tools
-#
-# For a list of all available actions, check out
-#
-#     https://docs.fastlane.tools/actions
-#
-# For a list of all available plugins, check out
-#
-#     https://docs.fastlane.tools/plugins/available-plugins
-#
-
-# Uncomment the line if you want fastlane to automatically update itself
-# update_fastlane
+project_name= "CachePodsDemo"
+scheme = project_name
+build_configuration = "Release"
+project_path = "./#{project_name}.xcodeproj"
+export_method = "app-store"
+cached_derived_data_path = File.expand_path("../cached_derived_data")
+cache_folder = File.expand_path("#{cached_derived_data_path}/Build/Intermediates.noindex/ArchiveIntermediates/#{scheme}/BuildProductsPath/#{build_configuration}-iphoneos")
+intermediates_path = "#{cached_derived_data_path}/Build/Intermediates.noindex/ArchiveIntermediates/#{project_name}"
 
 default_platform(:ios)
 
 platform :ios do
   desc "Build iOS"
   lane :build do
-        build_app(
-      workspace: "CachePodsDemo.xcworkspace",
-      scheme: "CachePodsDemo",
+    build_app(
+      workspace: "#{project_name}.xcworkspace",
+      scheme: project_name,
       export_xcargs: "-allowProvisioningUpdates"
     )
   end
+
+  desc "Build iOS with pods caching"
+    lane :cached_build do
+
+      puts "### check if cache exists "
+      if(File.exist?(cache_folder))
+        # - Loop over scripts in build phase `[CP] Copy Pods Resources`
+        # - Prepend `BUILT_PRODUCTS_DIR=#{cache_folder}``
+        fastlane_require 'xcodeproj'
+        project = Xcodeproj::Project.open("../#{project_name}.xcodeproj")
+        target = project.targets.select { |target| target.name == project_name }.first
+        phase = target.shell_script_build_phases.select { |phase| phase.name && phase.name.include?('Copy Pods Resources') }.first
+        if (!phase.shell_script.start_with?('BUILT_PRODUCTS_DIR'))
+          phase.shell_script = "BUILT_PRODUCTS_DIR=#{cache_folder} #{phase.shell_script}"
+          project.save()
+        end
+
+        puts "### build only .xcodeproj"
+        gym(
+          clean: false,
+          project: "./#{project_name}.xcodeproj",
+          scheme: scheme,
+          export_method: export_method,
+          configuration: build_configuration,
+          destination: 'generic/platform=iOS',
+          export_options: {
+            compileBitcode: false,
+            uploadBitcode: false,
+            uploadSymbols: false 
+          },
+          xcargs: [
+              # Set paths where xcode can find pods binaries
+              "PODS_CONFIGURATION_BUILD_DIR=#{cache_folder}",
+              "FRAMEWORK_SEARCH_PATHS='#{cache_folder} $(inherited)'",
+              "LIBRARY_SEARCH_PATHS='#{cache_folder} $(inherited)'",
+              "SWIFT_INCLUDE_PATHS=#{cache_folder}"
+          ].join(" ")
+        )
+      else
+        puts "### build full app .xcworkspace"
+        gym(
+          scheme: scheme,
+          workspace: "./#{project_name}.xcworkspace",
+          export_method: export_method,
+          derived_data_path: cached_derived_data_path,
+          configuration: build_configuration,
+          clean: true,
+        )
+
+        puts "### reduce cache size by removing unnecessary files"
+        require 'fileutils';
+        dirs = [
+          File.expand_path("#{cached_derived_data_path}/info.plist"),
+          File.expand_path("#{cached_derived_data_path}/Logs"),
+          File.expand_path("#{cached_derived_data_path}/SourcePackages"),
+          File.expand_path("#{cached_derived_data_path}/ModuleCache.noindex"),
+          File.expand_path("#{intermediates_path}/IntermediateBuildFilesPath/#{project_name}.build"),
+          File.expand_path("#{intermediates_path}/IntermediateBuildFilesPath/XCBuildData"),
+          File.expand_path("#{intermediates_path}/BuildProductsPath/SwiftSupport"),
+          File.expand_path("#{intermediates_path}/PrecompiledHeaders")
+        ]
+        dirs.each { |dir| FileUtils.rm_rf(dir) }
+      end
+    end
 end

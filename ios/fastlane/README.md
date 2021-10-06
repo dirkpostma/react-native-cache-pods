@@ -21,6 +21,11 @@ or alternatively using `brew install fastlane`
 fastlane ios build
 ```
 Build iOS
+### ios cached_build
+```
+fastlane ios cached_build
+```
+Build iOS with pods caching
 
 ----
 
