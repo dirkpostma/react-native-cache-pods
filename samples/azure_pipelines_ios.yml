@@ -1,0 +1,177 @@
+name: $(Date:yyyyMMdd)$(Rev:rr)
+
+trigger: none
+
+variables:
+  YARN_CACHE_FOLDER: $(Pipeline.Workspace)/.yarn
+  MY_BUILD_NUMBER: $(Build.BuildNumber)
+  NODE_OPTIONS: "--max_old_space_size=4096"
+
+jobs:
+- job: BuildApp
+  displayName: 'Build App'
+  timeoutInMinutes: 120
+  cancelTimeoutInMinutes: 120
+  pool:
+    vmImage: 'macos-11'
+
+  steps:
+
+  - task: NodeTool@0
+    inputs:
+      versionSpec: '14.x'
+
+  - task: Bash@3
+    displayName: "pods: md5 Podfile.lock"
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd ios
+        echo "Podfile.lock md5: $(md5 -q Podfile.lock)"
+        PODFILE_LOCK_MD5="$(md5 -q Podfile.lock)"
+        echo "##vso[task.setvariable variable=PODFILE_LOCK_MD5]$PODFILE_LOCK_MD5"
+
+  - task: AzureCLI@2
+    continueOnError: true
+    displayName: "pods: check cache"
+    inputs:
+      azureSubscription: 'Pay-As-You-Go (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        az storage blob download -f ios/pods_cache.zip -c cache -n "pods_cache-$(PODFILE_LOCK_MD5).zip" --connection-string "$(AZURE_STORAGE_CONNECTION_STRING)"
+
+  - task: Bash@3
+    continueOnError: true
+    condition: succeededOrFailed()
+    displayName: "pods: unzip"
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd ios
+        unzip pods_cache.zip
+        [ -d "Pods" ] && PODS_CACHE_RESTORED="true"
+        echo "##vso[task.setvariable variable=PODS_CACHE_RESTORED]$PODS_CACHE_RESTORED"
+        [ -d ".local_derived_data" ] && PODS_DERIVED_CACHE_RESTORED="true"
+        echo "##vso[task.setvariable variable=PODS_DERIVED_CACHE_RESTORED]$PODS_DERIVED_CACHE_RESTORED"
+        echo "executing diff Podfile.lock ./Pods/Manifest.lock ..."
+        diff Podfile.lock ./Pods/Manifest.lock
+        echo "Make sure Podfile.lock is same as Manifest.lock, see KHS PBI 11326"
+        cp ./Pods/Manifest.lock Podfile.lock
+        echo "Remove pods_cache.zip to prevent bundler error, see KHS PBI 11770 and 10674"
+        rm pods_cache.zip
+
+  - task: Cache@2
+    inputs:
+      key: 'yarn | "$(Agent.OS)" | yarn.lock'
+      restoreKeys: |
+        yarn | "$(Agent.OS)"
+      path: $(YARN_CACHE_FOLDER)
+    displayName: Cache Yarn packages
+
+  - script: yarn install --network-timeout 1000000 --frozen-lockfile --ignore-engines
+
+  - task: Bash@3
+    displayName: "Set app variant"
+    inputs:
+      targetType: 'inline'
+      script: |
+        yarn switch
+
+  - task: InstallAppleCertificate@2
+    inputs:
+      certSecureFile: 'xxxxxx.p12'
+      certPwd: "$(MY_DECRYPT_KEY)"
+      keychain: 'temp'
+
+  - task: InstallAppleProvisioningProfile@1
+    inputs:
+      provisioningProfileLocation: 'sourceRepository'
+      provProfileSourceRepository: "variants/$(MY_VARIANT)/ios/app.mobileprovision"
+
+  - task: CocoaPods@0
+    displayName: 'pod install using the CocoaPods task with defaults'
+    condition: ne(variables.PODS_CACHE_RESTORED, 'true')
+    inputs:
+      workingDirectory: 'ios'
+      forceRepoUpdate: false
+
+  - task: Bash@3
+    displayName: "Set buildnumber in Info.plist"
+    inputs:
+      targetType: 'inline'
+      script: |
+        echo "Setting build number $MY_BUILD_NUMBER"
+        plutil -replace CFBundleVersion -string "$MY_BUILD_NUMBER" ios/MyApp/Info.plist
+
+  - task: Bash@3
+    displayName: "Install fastlane"
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd ios
+        bundle install
+
+  - task: Bash@3
+    displayName: "fastlane ios info"
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd ios
+        bundle exec fastlane ios info
+
+  - task: Bash@3
+    continueOnError: true
+    displayName: "Build ios app"
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd ios
+        MY_DECRYPT_KEY="$(MY_DECRYPT_KEY)" MY_FIREBASE_CLI_TOKEN="$(MY_FIREBASE_CLI_TOKEN)" bundle exec fastlane ios cached_build
+
+  - task: Bash@3
+    displayName: "Show xCode log"
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd ~/Library/Logs/gym
+        ls
+        cat MyApp-MyApp.log
+
+  - task: Bash@3
+    condition: ne(variables.PODS_DERIVED_CACHE_RESTORED, 'true')
+    continueOnError: true
+    displayName: "pods: zip"
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd ios
+        ls -la
+        rm pods_cache.zip
+        zip -r pods_cache.zip ./.local_derived_data
+        zip -r pods_cache.zip ./Pods
+
+  - task: AzureCLI@2
+    displayName: "pods: upload to cache"
+    continueOnError: true
+    condition: ne(variables.PODS_DERIVED_CACHE_RESTORED, 'true')
+    inputs:
+      azureSubscription: 'Pay-As-You-Go (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        az storage blob upload -f ios/pods_cache.zip -c cache -n "pods_cache-$(PODFILE_LOCK_MD5).zip" --connection-string "$(AZURE_STORAGE_CONNECTION_STRING)"
+
+  - task: PublishBuildArtifacts@1
+    displayName: "Publish IPA Build Artifact"
+    inputs:
+      PathtoPublish: "ios/MyApp.ipa"
+      ArtifactName: 'drop'
+      publishLocation: 'Container'
+
+  - task: PublishBuildArtifacts@1
+    displayName: "Publish dSYM Build Artifact"
+    inputs:
+      PathtoPublish: "ios/MyApp.app.dSYM.zip"
+      ArtifactName: 'drop'
+      publishLocation: 'Container'
